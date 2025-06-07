@@ -1,0 +1,102 @@
+name: "Cache Node Modules and Install Dependencies"
+
+description: "Composite action to cache node_modules and install dependencies."
+
+inputs:
+  appVersion:
+    description: "Version of the app for caching."
+    required: false
+    default: "1.0.0"
+  registryToken:
+    description: "Optional GitHub token for authentication when installing dependencies from private package registries."
+    required: false
+  targetBranch:
+    description: "Target branch for the workflow. If not provided, will use the repository default branch."
+    required: false
+    default: ""
+  workingDir:
+    description: "Directory containing package.json and where node_modules should be installed. Useful for monorepos."
+    required: false
+    default: "."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Log in to GitHub Package Registry
+      id: login-gpr
+      if: inputs.registryToken != ''
+      shell: bash
+      run: |
+        echo "//npm.pkg.github.com/:_authToken=${{ inputs.registryToken }}" > ~/.npmrc
+        echo "always-auth=true" >> ~/.npmrc
+        cat ~/.npmrc
+        echo "Logged in to GitHub Package Registry"
+
+    - name: Check for package.json changes
+      id: check-package-changes
+      shell: bash
+      run: |
+        chmod +x ${GITHUB_ACTION_PATH}/check-package-changes.sh
+        if ${GITHUB_ACTION_PATH}/check-package-changes.sh "${{ inputs.targetBranch }}" "${{ inputs.workingDir }}"; then
+          echo "changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "changes=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Restore cached node_modules
+      id: node_modules-restore
+      uses: actions/cache/restore@v3
+      # Only restore cache if there are no package.json changes
+      if: steps.check-package-changes.outputs.changes == 'false'
+      with:
+        path: ${{ inputs.workingDir }}/node_modules
+        key: ${{ runner.os }}-${{ inputs.workingDir }}-node_modules-${{ inputs.appVersion }}
+        restore-keys: |
+          ${{ runner.os }}-${{ inputs.workingDir }}-node_modules-${{ hashFiles(format('{0}/package-lock.json', inputs.workingDir)) }}
+          ${{ runner.os }}-${{ inputs.workingDir }}-node_modules-${{ inputs.appVersion }}
+
+    - name: Install Dependencies
+      shell: bash
+      if: steps.node_modules-restore.outputs.cache-hit != 'true'
+      run: |
+        echo "Installing dependencies in ${{ inputs.workingDir }}..."
+        # Check if npm is available
+        if ! command -v npm &> /dev/null; then
+          echo "::error::npm command not found. Please ensure Node.js is installed in your workflow."
+          exit 1
+        fi
+
+        cd "${{ inputs.workingDir }}" || { echo "::error::Failed to change to directory ${{ inputs.workingDir }}"; exit 1; }
+
+        if npm ci --legacy-peer-deps; then
+            echo "Dependencies installed successfully!"
+        else
+            EXIT_CODE=$?
+            echo "npm ci failed with exit code $EXIT_CODE"
+            echo "::error::Failed to install dependencies"
+            exit $EXIT_CODE
+        fi
+
+    - name: Cache repo node_modules
+      if: steps.node_modules-restore.outputs.cache-hit != 'true'
+      id: node_modules-package-cache
+      uses: actions/cache/save@v3
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node_modules-${{ hashFiles('**/package-lock.json') }}
+
+    - name: Cache version node_modules
+      if: steps.node_modules-restore.outputs.cache-hit != 'true'
+      id: node_modules-version-cache
+      uses: actions/cache/save@v3
+      with:
+        path: ${{ inputs.workingDir }}/node_modules
+        key: ${{ runner.os }}-${{ inputs.workingDir }}-node_modules-${{ inputs.appVersion }}
+
+    - name: Validate and notify dependency status
+      id: validation
+      shell: bash
+      run: |
+        chmod +x ${GITHUB_ACTION_PATH}/validate-dependencies.sh
+        cd "${{ inputs.workingDir }}" || { echo "::error::Failed to change to directory ${{ inputs.workingDir }}"; exit 1; }
+        CACHE_HIT=${{ steps.node_modules-restore.outputs.cache-hit }} WORKING_DIR="${{ inputs.workingDir }}" ${GITHUB_ACTION_PATH}/validate-dependencies.sh
